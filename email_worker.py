@@ -7,11 +7,44 @@ import os
 import re
 import json
 import ssl
+import socket
 from email.mime.text import MIMEText
 from email.utils import parseaddr, make_msgid
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ===================== NETWORK HELPERS =====================
+def _resolve_ipv4(host: str) -> str:
+    """Return an IPv4 address for host. Helps on platforms without IPv6 egress (e.g. some PaaS)."""
+    try:
+        infos = socket.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        if infos:
+            return infos[0][4][0]
+    except Exception:
+        pass
+    return host  # fallback: let the OS resolve
+
+def _smtp_connect_starttls(host: str, port: int, timeout: int = 30) -> smtplib.SMTP:
+    """SMTP connect via IPv4 and upgrade to TLS (STARTTLS)."""
+    ip = _resolve_ipv4(host)
+    server = smtplib.SMTP(timeout=timeout)
+    server._host = host  # used as SNI hostname by smtplib during starttls
+    server.connect(ip, port)
+    server.ehlo()
+    ctx = ssl.create_default_context()
+    server.starttls(context=ctx)
+    server.ehlo()
+    return server
+
+def _imap_connect_ssl(host: str, port: int, timeout: int = 30) -> imaplib.IMAP4_SSL:
+    """IMAP SSL connect via IPv4. We disable hostname check because we connect by IP."""
+    ip = _resolve_ipv4(host)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    # keep certificate verification
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return imaplib.IMAP4_SSL(host=ip, port=port, ssl_context=ctx, timeout=timeout)
 
 # ===================== CONFIG =====================
 
@@ -70,16 +103,12 @@ TEXTS = {
         "en": "Please reply with a number from the list (for example: 1 or 2).",
         "km": "សូមឆ្លើយជាលេខពីបញ្ជី (ឧទាហរណ៍៖ 1 ឬ 2)។",
     },
-    # ✅ вместо "gender" — один вопрос про обращение (title)
-    "ask_title": {
-        "en": "How should we address you? (optional)\n1) Mr\n2) Mrs\n3) Ms\n4) Prefer not to say\n\nReply with 1/2/3/4 or type 'skip'.",
-        "km": "យើងគួរហៅអ្នកដូចម្តេច? (មិនចាំបាច់)\n1) Mr\n2) Mrs\n3) Ms\n4) មិនចង់ប្រាប់\n\nឆ្លើយ 1/2/3/4 ឬសរសេរ 'skip'។",
+    "ask_contact": {
+        "en": "How should we address you? (optional)\nPlease write your name + preferred title (Mr/Mrs/Ms), for example: \"Mr Sokha\" or \"Sokha (Ms)\".\n\nYou can also type 'skip'.",
+        "km": "យើងគួរហៅអ្នកដូចម្តេច? (មិនចាំបាច់)\nសូមសរសេរឈ្មោះ + ការហៅ (Mr/Mrs/Ms) ឧទាហរណ៍៖ \"Mr Sokha\" ឬ \"Sokha (Ms)\"។\n\nអ្នកអាចសរសេរ 'skip' បានផងដែរ។",
     },
-    "ask_name": {
-        "en": "Please write your name (or preferred form of address).",
-        "km": "សូមសរសេរឈ្មោះរបស់អ្នក (ឬវិធីហៅដែលអ្នកស្រួល)។",
-    },
-    "lang_set": {"en": "Language updated ✅", "km": "បានប្ដូរភាសារួចរាល់ ✅"},
+
+    # ✅ вместо "gender" — один вопрос про обращение (title)    "lang_set": {"en": "Language updated ✅", "km": "បានប្ដូរភាសារួចរាល់ ✅"},
     "stopped": {
         "en": "No problem. If you change your mind, just email us again anytime.",
         "km": "មិនអីទេ។ បើអ្នកចង់ចាប់ផ្តើមម្ដងទៀត សូមផ្ញើអ៊ីមែលមកយើងពេលណាក៏បាន។",
@@ -173,26 +202,42 @@ def _merge_references(existing_refs: str | None, new_msgid: str | None) -> str:
 
 
 def send_email(to_email: str, subject: str, body: str, *, in_reply_to: str | None = None, references: str | None = None):
+    """Send plain text email via Gmail SMTP (STARTTLS).
+
+    On some PaaS networks IPv6 egress can be blocked which makes smtp.gmail.com fail with
+    "Network is unreachable". We force IPv4 resolution and retry a few times.
+    """
     msg = MIMEText(body, "plain", "utf-8")
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = to_email
     msg["Subject"] = subject
     msg["Message-ID"] = make_msgid()
 
-    # ✅ one thread
+    # ✅ keep the conversation in one thread
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = references
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        server.send_message(msg)
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            server = _smtp_connect_starttls(SMTP_HOST, SMTP_PORT, timeout=30)
+            try:
+                server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                server.send_message(msg)
+                return
+            finally:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+        except Exception as e:
+            last_err = e
+            # short backoff
+            time.sleep(1.5 * attempt)
 
-# ===================== DB =====================
-
-SESSION_STATUS_IN_PROGRESS = "in_progress"
+    raise last_err or RuntimeError("SMTP send failed")
 
 async def ensure_provider_by_email(conn, email_addr: str) -> str:
     email_addr = (email_addr or "").strip().lower()
@@ -309,6 +354,7 @@ async def get_next_question(conn, session_id: str, category_id: str):
                on a.session_id=$1 and a.question_id=q.id
         where q.category_id=$2
           and q.is_active=true
+          and q.code not in ('gender','title','salutation','name','contact','contact_name','contact_title','preferred_title','preferred_name')
           and a.id is null
         order by q.sort_order asc, q.created_at asc
         limit 1
@@ -572,41 +618,30 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
         await set_session_category(conn, session_id, str(chosen["id"]))
 
         # ✅ дальше: один вопрос про обращение (Mr/Mrs/Ms)
-        await update_state(conn, session_id, {"step": "await_title"})
-        send_email(from_email, INTRO_SUBJECT, TEXTS["ask_title"][lang], in_reply_to=in_reply_to, references=references)
+        await update_state(conn, session_id, {"step": "await_contact"})
+        send_email(from_email, INTRO_SUBJECT, TEXTS["ask_contact"][lang], in_reply_to=in_reply_to, references=references)
         log("Category chosen:", chosen["id"], "email:", from_email)
         return
 
-    # Step: await_title (optional)
-    if step == "await_title":
-        c = norm_cmd(text)
-        if c == "skip":
-            await update_state(conn, session_id, {"title": None, "step": "await_name"})
-            send_email(from_email, INTRO_SUBJECT, TEXTS["ask_name"][lang], in_reply_to=in_reply_to, references=references)
-            return
-
-        n = parse_first_number(c)
-        if n not in (1, 2, 3, 4):
-            send_email(from_email, INTRO_SUBJECT, TEXTS["ask_title"][lang], in_reply_to=in_reply_to, references=references)
-            return
-
-        title_map = {1: "mr", 2: "mrs", 3: "ms", 4: "no_answer"}
-        await update_state(conn, session_id, {"title": title_map[n], "step": "await_name"})
-        send_email(from_email, INTRO_SUBJECT, TEXTS["ask_name"][lang], in_reply_to=in_reply_to, references=references)
-        return
-
-    # Step: await_name
-    if step == "await_name":
-        name = (text or "").strip()
-        if name:
-            # ✅ после имени НЕ останавливаемся — сразу начинаем вопросы
-            await update_state(conn, session_id, {"name": name, "step": "await_question"})
+    # Step: await_contact (optional)
+    if step == "await_contact":
+        raw = (text or "").strip()
+        if raw.lower() in ("skip", "pass", "-"):
+            await update_state(conn, session_id, {"contact": None, "step": "await_question"})
             await send_next_question_or_finish(conn, from_email, session_id, lang, in_reply_to=in_reply_to, references=references)
-            log("Name saved:", name, "email:", from_email)
             return
 
-        send_email(from_email, INTRO_SUBJECT, TEXTS["ask_name"][lang], in_reply_to=in_reply_to, references=references)
+        if raw:
+            # store everything in ONE field (as requested)
+            await update_state(conn, session_id, {"contact": raw, "step": "await_question"})
+            await send_next_question_or_finish(conn, from_email, session_id, lang, in_reply_to=in_reply_to, references=references)
+            log("Contact saved:", raw, "email:", from_email)
+            return
+
+        send_email(from_email, INTRO_SUBJECT, TEXTS["ask_contact"][lang], in_reply_to=in_reply_to, references=references)
         return
+
+    # Step: await_question
 
     # Step: await_question
     if step == "await_question":
@@ -628,7 +663,7 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
 # ===================== IMAP LOOP =====================
 
 async def process_incoming_emails(conn):
-    mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    mail = _imap_connect_ssl(IMAP_HOST, IMAP_PORT)
     mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
     mail.select("inbox")
 
