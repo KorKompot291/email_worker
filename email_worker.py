@@ -7,6 +7,7 @@ import os
 import re
 import json
 import ssl
+import certifi
 import socket
 from email.mime.text import MIMEText
 from email.utils import parseaddr, make_msgid
@@ -32,7 +33,7 @@ def _smtp_connect_starttls(host: str, port: int, timeout: int = 30) -> smtplib.S
     server._host = host  # used as SNI hostname by smtplib during starttls
     server.connect(ip, port)
     server.ehlo()
-    ctx = ssl.create_default_context()
+    ctx = make_tls_context(insecure=INSECURE_TLS)
     server.starttls(context=ctx)
     server.ehlo()
     return server
@@ -40,7 +41,7 @@ def _smtp_connect_starttls(host: str, port: int, timeout: int = 30) -> smtplib.S
 def _imap_connect_ssl(host: str, port: int, timeout: int = 30) -> imaplib.IMAP4_SSL:
     """IMAP SSL connect via IPv4. We disable hostname check because we connect by IP."""
     ip = _resolve_ipv4(host)
-    ctx = ssl.create_default_context()
+    ctx = make_tls_context(insecure=INSECURE_TLS)
     ctx.check_hostname = False
     # keep certificate verification
     ctx.verify_mode = ssl.CERT_REQUIRED
@@ -51,7 +52,7 @@ def _imap_connect_ssl(host: str, port: int, timeout: int = 30) -> imaplib.IMAP4_
 DB_DSN = os.getenv("DB_DSN")
 
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+GMAIL_APP_PASSWORD = (os.getenv("GMAIL_APP_PASSWORD") or "").strip().replace(" ", "")
 
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
@@ -108,7 +109,8 @@ TEXTS = {
         "km": "យើងគួរហៅអ្នកដូចម្តេច? (មិនចាំបាច់)\nសូមសរសេរឈ្មោះ + ការហៅ (Mr/Mrs/Ms) ឧទាហរណ៍៖ \"Mr Sokha\" ឬ \"Sokha (Ms)\"។\n\nអ្នកអាចសរសេរ 'skip' បានផងដែរ។",
     },
 
-    # ✅ вместо "gender" — один вопрос про обращение (title)    "lang_set": {"en": "Language updated ✅", "km": "បានប្ដូរភាសារួចរាល់ ✅"},
+    # ✅ вместо "gender" — один вопрос про обращение (title)
+    "lang_set": {"en": "Language updated ✅", "km": "បានប្ដូរភាសារួចរាល់ ✅"},
     "stopped": {
         "en": "No problem. If you change your mind, just email us again anytime.",
         "km": "មិនអីទេ។ បើអ្នកចង់ចាប់ផ្តើមម្ដងទៀត សូមផ្ញើអ៊ីមែលមកយើងពេលណាក៏បាន។",
@@ -127,6 +129,17 @@ TEXTS = {
 
 def log(*args):
     print("[email_worker]", *args)
+
+
+def make_tls_context(*, insecure: bool = False) -> ssl.SSLContext:
+    """TLS context with a reliable CA bundle (certifi). If insecure=True, disables verification."""
+    if insecure:
+        ctx = make_tls_context(insecure=INSECURE_TLS)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    # Use certifi CA bundle (works well on minimal containers)
+    return ssl.create_default_context(cafile=certifi.where())
 
 # ===================== HELPERS =====================
 
@@ -716,7 +729,7 @@ async def main():
 
     while True:
         try:
-            ssl_ctx = ssl.create_default_context()
+            ssl_ctx = make_tls_context(insecure=INSECURE_TLS)
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
 
