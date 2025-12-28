@@ -50,6 +50,7 @@ def _imap_connect_ssl(host: str, port: int, timeout: int = 30) -> imaplib.IMAP4_
 # ===================== CONFIG =====================
 
 DB_DSN = os.getenv("DB_DSN")
+INSECURE_TLS = os.getenv("INSECURE_TLS", "0").strip().lower() in {"1","true","yes","y","on"}
 
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = (os.getenv("GMAIL_APP_PASSWORD") or "").strip().replace(" ", "")
@@ -132,15 +133,14 @@ def log(*args):
 
 
 def make_tls_context(*, insecure: bool = False) -> ssl.SSLContext:
-    """TLS context with a reliable CA bundle (certifi). If insecure=True, disables verification."""
+    """TLS context. If insecure=True, disables certificate verification (useful for Railway/self-signed DB certs)."""
     if insecure:
-        ctx = make_tls_context(insecure=INSECURE_TLS)
+        ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
-    # Use certifi CA bundle (works well on minimal containers)
+    # Verified TLS using certifi CA bundle (works well on minimal containers)
     return ssl.create_default_context(cafile=certifi.where())
-
 # ===================== HELPERS =====================
 
 def clean_reply_text(raw: str) -> str:
