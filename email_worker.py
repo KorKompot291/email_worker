@@ -15,6 +15,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def _env_bool(*names: str, default: bool = False) -> bool:
+    """Read boolean from env. Accepts 1/0, true/false, yes/no, on/off."""
+    for n in names:
+        v = os.getenv(n)
+        if v is None:
+            continue
+        v = str(v).strip().lower()
+        if v in ("1","true","yes","y","on"):
+            return True
+        if v in ("0","false","no","n","off"):
+            return False
+    return default
+
+# If True, disables TLS certificate verification for DB/IMAP/SMTP.
+# Use only if you see SSL_CERTIFICATE_VERIFY_FAILED in Railway.
+INSECURE_TLS = _env_bool("INSECURE_TLS", "INSECURE", "insecure", default=False)
+
+
 # ===================== NETWORK HELPERS =====================
 def _resolve_ipv4(host: str) -> str:
     """Return an IPv4 address for host. Helps on platforms without IPv6 egress (e.g. some PaaS)."""
@@ -142,6 +160,17 @@ def make_tls_context(*, insecure: bool = False) -> ssl.SSLContext:
     # Verified TLS using certifi CA bundle (works well on minimal containers)
     return ssl.create_default_context(cafile=certifi.where())
 # ===================== HELPERS =====================
+
+
+def make_pg_ssl_context(insecure: bool) -> ssl.SSLContext:
+    """Postgres SSL context. Uses certifi bundle when available."""
+    if insecure:
+        return make_tls_context(True)
+    try:
+        import certifi  # type: ignore
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 def clean_reply_text(raw: str) -> str:
     lines = (raw or "").splitlines()
@@ -729,10 +758,7 @@ async def main():
 
     while True:
         try:
-            ssl_ctx = make_tls_context(insecure=INSECURE_TLS)
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
-
+            ssl_ctx = make_pg_ssl_context(INSECURE_TLS)
             conn = await asyncpg.connect(DB_DSN, ssl=ssl_ctx)
 
             await process_outreach_queue(conn)
