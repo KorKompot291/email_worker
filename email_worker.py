@@ -150,15 +150,46 @@ def _resolve_ipv4(host: str) -> str:
         pass
     return host
 
-def _smtp_connect_starttls(host: str, port: int, timeout: int = 30) -> smtplib.SMTP:
-    """SMTP connect via IPv4 and upgrade to TLS (STARTTLS)."""
+def _smtp_connect_starttls(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
+    """SMTP connect via IPv4 and upgrade to TLS (STARTTLS) with hard connect timeout."""
     ip = _resolve_ipv4(host)
+    log(f"SMTP(STARTTLS) resolving {host} -> {ip}:{port}")
+
+    # hard timeout connect
+    sock = socket.create_connection((ip, port), timeout=timeout)
     server = smtplib.SMTP(timeout=timeout)
-    server._host = host  # SNI hostname used by smtplib
-    server.connect(ip, port)
+    server._host = host  # SNI hostname
+    server.sock = sock
+    server.file = sock.makefile("rb")
+
+    # complete SMTP greeting
+    code, msg = server.getreply()
+    log(f"SMTP greeting: {code} {msg!r}")
+
     server.ehlo()
     ctx = make_tls_context(insecure=INSECURE_TLS)
+    log("SMTP starttls...")
     server.starttls(context=ctx)
+    server.ehlo()
+    return server
+
+def _smtp_connect_ssl_465(host: str, port: int = 465, timeout: int = 20) -> smtplib.SMTP_SSL:
+    """SMTP SSL connect (port 465) via IPv4 with hard connect timeout."""
+    ip = _resolve_ipv4(host)
+    log(f"SMTP(SSL465) resolving {host} -> {ip}:{port}")
+
+    ctx = make_tls_context(insecure=INSECURE_TLS)
+
+    # hard timeout connect
+    sock = socket.create_connection((ip, port), timeout=timeout)
+    server = smtplib.SMTP_SSL(host=host, port=port, timeout=timeout, context=ctx)
+    # Force using our connected socket to avoid re-connect
+    server.sock = sock
+    server.file = sock.makefile("rb")
+
+    code, msg = server.getreply()
+    log(f"SMTP SSL greeting: {code} {msg!r}")
+
     server.ehlo()
     return server
 
@@ -250,21 +281,36 @@ def send_email(to_email: str, subject: str, body: str, *, in_reply_to: str | Non
         msg["References"] = references
 
     last_err: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            server = _smtp_connect_starttls(SMTP_HOST, SMTP_PORT, timeout=30)
+
+    # Try 587 STARTTLS first, then fallback 465 SSL
+    attempts = [
+        ("starttls", lambda: _smtp_connect_starttls(SMTP_HOST, SMTP_PORT, timeout=20)),
+        ("ssl465",   lambda: _smtp_connect_ssl_465(SMTP_HOST, 465, timeout=20)),
+    ]
+
+    for attempt_no in range(1, 4):
+        for mode, connector in attempts:
             try:
-                server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-                server.send_message(msg)
-                return
-            finally:
+                log(f"SMTP attempt {attempt_no}/3 mode={mode} to={to_email}")
+
+                server = connector()
                 try:
-                    server.quit()
-                except Exception:
-                    pass
-        except Exception as e:
-            last_err = e
-            time.sleep(1.5 * attempt)
+                    log("SMTP login...")
+                    server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+                    log("SMTP send_message...")
+                    server.send_message(msg)
+                    log("SMTP sent OK ✅")
+                    return
+                finally:
+                    try:
+                        server.quit()
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                last_err = e
+                log(f"SMTP failed mode={mode} attempt={attempt_no}: {repr(e)}")
+                time.sleep(1.5 * attempt_no)
 
     raise last_err or RuntimeError("SMTP send failed")
 
