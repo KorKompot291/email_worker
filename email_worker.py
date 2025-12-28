@@ -9,11 +9,18 @@ import json
 import ssl
 import certifi
 import socket
+import time
 from email.mime.text import MIMEText
 from email.utils import parseaddr, make_msgid
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ===================== CONSTANTS =====================
+
+SESSION_STATUS_IN_PROGRESS = "in_progress"
+
+# ===================== ENV HELPERS =====================
 
 def _env_bool(*names: str, default: bool = False) -> bool:
     """Read boolean from env. Accepts 1/0, true/false, yes/no, on/off."""
@@ -22,9 +29,9 @@ def _env_bool(*names: str, default: bool = False) -> bool:
         if v is None:
             continue
         v = str(v).strip().lower()
-        if v in ("1","true","yes","y","on"):
+        if v in ("1", "true", "yes", "y", "on"):
             return True
-        if v in ("0","false","no","n","off"):
+        if v in ("0", "false", "no", "n", "off"):
             return False
     return default
 
@@ -32,43 +39,9 @@ def _env_bool(*names: str, default: bool = False) -> bool:
 # Use only if you see SSL_CERTIFICATE_VERIFY_FAILED in Railway.
 INSECURE_TLS = _env_bool("INSECURE_TLS", "INSECURE", "insecure", default=False)
 
-
-# ===================== NETWORK HELPERS =====================
-def _resolve_ipv4(host: str) -> str:
-    """Return an IPv4 address for host. Helps on platforms without IPv6 egress (e.g. some PaaS)."""
-    try:
-        infos = socket.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
-        if infos:
-            return infos[0][4][0]
-    except Exception:
-        pass
-    return host  # fallback: let the OS resolve
-
-def _smtp_connect_starttls(host: str, port: int, timeout: int = 30) -> smtplib.SMTP:
-    """SMTP connect via IPv4 and upgrade to TLS (STARTTLS)."""
-    ip = _resolve_ipv4(host)
-    server = smtplib.SMTP(timeout=timeout)
-    server._host = host  # used as SNI hostname by smtplib during starttls
-    server.connect(ip, port)
-    server.ehlo()
-    ctx = make_tls_context(insecure=INSECURE_TLS)
-    server.starttls(context=ctx)
-    server.ehlo()
-    return server
-
-def _imap_connect_ssl(host: str, port: int, timeout: int = 30) -> imaplib.IMAP4_SSL:
-    """IMAP SSL connect via IPv4. We disable hostname check because we connect by IP."""
-    ip = _resolve_ipv4(host)
-    ctx = make_tls_context(insecure=INSECURE_TLS)
-    ctx.check_hostname = False
-    # keep certificate verification
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    return imaplib.IMAP4_SSL(host=ip, port=port, ssl_context=ctx, timeout=timeout)
-
 # ===================== CONFIG =====================
 
 DB_DSN = os.getenv("DB_DSN")
-INSECURE_TLS = os.getenv("INSECURE_TLS", "0").strip().lower() in {"1","true","yes","y","on"}
 
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = (os.getenv("GMAIL_APP_PASSWORD") or "").strip().replace(" ", "")
@@ -127,8 +100,6 @@ TEXTS = {
         "en": "How should we address you? (optional)\nPlease write your name + preferred title (Mr/Mrs/Ms), for example: \"Mr Sokha\" or \"Sokha (Ms)\".\n\nYou can also type 'skip'.",
         "km": "យើងគួរហៅអ្នកដូចម្តេច? (មិនចាំបាច់)\nសូមសរសេរឈ្មោះ + ការហៅ (Mr/Mrs/Ms) ឧទាហរណ៍៖ \"Mr Sokha\" ឬ \"Sokha (Ms)\"។\n\nអ្នកអាចសរសេរ 'skip' បានផងដែរ។",
     },
-
-    # ✅ вместо "gender" — один вопрос про обращение (title)
     "lang_set": {"en": "Language updated ✅", "km": "បានប្ដូរភាសារួចរាល់ ✅"},
     "stopped": {
         "en": "No problem. If you change your mind, just email us again anytime.",
@@ -138,10 +109,7 @@ TEXTS = {
         "en": "Thanks! Your details were received and sent for moderation. We'll get back to you soon.\n\n@khmersoultours",
         "km": "អរគុណ! ព័ត៌មានរបស់អ្នកត្រូវបានទទួល និងផ្ញើសម្រាប់ការត្រួតពិនិត្យ។ យើងនឹងតបត្រឡប់ឆាប់ៗនេះ។\n\n@khmersoultours",
     },
-    "skip_ok": {
-        "en": "Okay ✅",
-        "km": "បានហើយ ✅",
-    }
+    "skip_ok": {"en": "Okay ✅", "km": "បានហើយ ✅"},
 }
 
 # ===================== LOGGING =====================
@@ -149,28 +117,62 @@ TEXTS = {
 def log(*args):
     print("[email_worker]", *args)
 
+# ===================== TLS HELPERS =====================
 
-def make_tls_context(*, insecure: bool = False) -> ssl.SSLContext:
-    """TLS context. If insecure=True, disables certificate verification (useful for Railway/self-signed DB certs)."""
+def make_tls_context(insecure: bool = False) -> ssl.SSLContext:
+    """
+    TLS context.
+    If insecure=True, disables certificate verification (useful for Railway/self-signed DB certs).
+
+    NOTE: This function intentionally accepts positional args too (insecure),
+    to avoid 'takes 0 positional arguments but 1 was given' crashes.
+    """
     if insecure:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
-    # Verified TLS using certifi CA bundle (works well on minimal containers)
     return ssl.create_default_context(cafile=certifi.where())
-# ===================== HELPERS =====================
-
 
 def make_pg_ssl_context(insecure: bool) -> ssl.SSLContext:
-    """Postgres SSL context. Uses certifi bundle when available."""
-    if insecure:
-        return make_tls_context(True)
+    """Postgres SSL context."""
+    return make_tls_context(insecure=insecure)
+
+# ===================== NETWORK HELPERS =====================
+
+def _resolve_ipv4(host: str) -> str:
+    """Return an IPv4 address for host. Helps on platforms without IPv6 egress."""
     try:
-        import certifi  # type: ignore
-        return ssl.create_default_context(cafile=certifi.where())
+        infos = socket.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        if infos:
+            return infos[0][4][0]
     except Exception:
-        return ssl.create_default_context()
+        pass
+    return host
+
+def _smtp_connect_starttls(host: str, port: int, timeout: int = 30) -> smtplib.SMTP:
+    """SMTP connect via IPv4 and upgrade to TLS (STARTTLS)."""
+    ip = _resolve_ipv4(host)
+    server = smtplib.SMTP(timeout=timeout)
+    server._host = host  # SNI hostname used by smtplib
+    server.connect(ip, port)
+    server.ehlo()
+    ctx = make_tls_context(insecure=INSECURE_TLS)
+    server.starttls(context=ctx)
+    server.ehlo()
+    return server
+
+def _imap_connect_ssl(host: str, port: int, timeout: int = 30) -> imaplib.IMAP4_SSL:
+    """IMAP SSL connect via IPv4. Disable hostname check because we connect by IP."""
+    ip = _resolve_ipv4(host)
+    ctx = make_tls_context(insecure=INSECURE_TLS)
+    ctx.check_hostname = False
+    # If insecure, keep CERT_NONE. If secure, require cert.
+    if not INSECURE_TLS:
+        ctx.verify_mode = ssl.CERT_REQUIRED
+    return imaplib.IMAP4_SSL(host=ip, port=port, ssl_context=ctx, timeout=timeout)
+
+# ===================== TEXT HELPERS =====================
 
 def clean_reply_text(raw: str) -> str:
     lines = (raw or "").splitlines()
@@ -188,15 +190,12 @@ def clean_reply_text(raw: str) -> str:
         out.append(s)
     return " ".join(out).strip()
 
-
 def norm_cmd(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip()).lower()
-
 
 def parse_first_number(text: str):
     m = re.search(r"\b(\d{1,2})\b", text or "")
     return int(m.group(1)) if m else None
-
 
 def as_dict_state(state_value):
     if state_value is None:
@@ -213,27 +212,21 @@ def as_dict_state(state_value):
             return {}
     return {}
 
-
 def is_yes(text: str) -> bool:
-    # ✅ YES/Yes/yES/yes!/ok yes/yep/yeah/y
     c = norm_cmd(text)
     return bool(re.search(r"\b(yes|y|ok|okay|yeah|yep)\b", c))
-
 
 def is_no(text: str) -> bool:
     c = norm_cmd(text)
     return bool(re.search(r"\b(no|n|stop|cancel)\b", c))
 
-
-def normalize_lang(lang: str | None) -> str:
+def normalize_lang(lang):
     lang = (lang or "").strip().lower()
     if lang in ("km", "kh", "khmer"):
         return "km"
     return "en"
 
-
 def _merge_references(existing_refs: str | None, new_msgid: str | None) -> str:
-    # Gmail threading: References = "msgid1 msgid2 ..."
     refs = []
     if existing_refs:
         refs.extend([r.strip() for r in existing_refs.split() if r.strip()])
@@ -242,20 +235,15 @@ def _merge_references(existing_refs: str | None, new_msgid: str | None) -> str:
             refs.append(new_msgid.strip())
     return " ".join(refs).strip()
 
+# ===================== SMTP SEND =====================
 
 def send_email(to_email: str, subject: str, body: str, *, in_reply_to: str | None = None, references: str | None = None):
-    """Send plain text email via Gmail SMTP (STARTTLS).
-
-    On some PaaS networks IPv6 egress can be blocked which makes smtp.gmail.com fail with
-    "Network is unreachable". We force IPv4 resolution and retry a few times.
-    """
     msg = MIMEText(body, "plain", "utf-8")
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = to_email
     msg["Subject"] = subject
     msg["Message-ID"] = make_msgid()
 
-    # ✅ keep the conversation in one thread
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
@@ -276,10 +264,11 @@ def send_email(to_email: str, subject: str, body: str, *, in_reply_to: str | Non
                     pass
         except Exception as e:
             last_err = e
-            # short backoff
             time.sleep(1.5 * attempt)
 
     raise last_err or RuntimeError("SMTP send failed")
+
+# ===================== DB HELPERS =====================
 
 async def ensure_provider_by_email(conn, email_addr: str) -> str:
     email_addr = (email_addr or "").strip().lower()
@@ -309,9 +298,7 @@ async def ensure_provider_by_email(conn, email_addr: str) -> str:
         raise RuntimeError("Provider insert/select failed for email=" + email_addr)
     return str(row["id"])
 
-
 async def get_active_email_session(conn, provider_id: str):
-    # ✅ фикс опечатки статуса
     return await conn.fetchrow("""
         select id, state, current_question_id, category_id, status
         from supplier.intake_sessions
@@ -321,7 +308,6 @@ async def get_active_email_session(conn, provider_id: str):
         order by started_at desc nulls last
         limit 1
     """, provider_id, SESSION_STATUS_IN_PROGRESS)
-
 
 async def create_email_session(conn, provider_id: str, lang: str, thread_msgid: str | None, thread_refs: str | None) -> str:
     state = {"lang": lang, "step": "await_yes"}
@@ -338,14 +324,12 @@ async def create_email_session(conn, provider_id: str, lang: str, thread_msgid: 
     """, provider_id, SESSION_STATUS_IN_PROGRESS, json.dumps(state))
     return str(row["id"])
 
-
 async def update_state(conn, session_id: str, patch: dict):
     await conn.execute("""
         update supplier.intake_sessions
         set state = coalesce(state,'{}'::jsonb) || $2::jsonb
         where id=$1
     """, session_id, json.dumps(patch))
-
 
 async def set_session_category(conn, session_id: str, category_id: str):
     await conn.execute("""
@@ -354,7 +338,6 @@ async def set_session_category(conn, session_id: str, category_id: str):
         where id=$1
     """, session_id, category_id)
 
-
 async def set_current_question(conn, session_id: str, question_id: str | None):
     await conn.execute("""
         update supplier.intake_sessions
@@ -362,14 +345,12 @@ async def set_current_question(conn, session_id: str, question_id: str | None):
         where id=$1
     """, session_id, question_id)
 
-
 async def complete_session(conn, session_id: str):
     await conn.execute("""
         update supplier.intake_sessions
         set status='completed', finished_at=now()
         where id=$1
     """, session_id)
-
 
 async def get_categories(conn):
     return await conn.fetch("""
@@ -379,14 +360,12 @@ async def get_categories(conn):
         order by code
     """)
 
-
 def format_categories(rows, lang: str):
     out = []
     for i, r in enumerate(rows, start=1):
         title = r["title_en"] if lang == "en" else (r["title_km"] or r["title_en"])
         out.append(f"{i}) {title}")
     return "\n".join(out)
-
 
 async def get_next_question(conn, session_id: str, category_id: str):
     return await conn.fetchrow("""
@@ -402,7 +381,6 @@ async def get_next_question(conn, session_id: str, category_id: str):
         limit 1
     """, session_id, category_id)
 
-
 async def save_answer_text(conn, session_id: str, question_id: str, text_original: str):
     await conn.execute("""
         insert into supplier.answers
@@ -417,7 +395,6 @@ async def save_answer_text(conn, session_id: str, question_id: str, text_origina
             updated_at=now()
     """, session_id, question_id, json.dumps({"text": text_original}), text_original, text_original)
 
-
 # -------- Outreach queue --------
 
 async def fetch_pending_outreach(conn, limit: int = 10):
@@ -429,7 +406,6 @@ async def fetch_pending_outreach(conn, limit: int = 10):
         limit $1
         for update skip locked
     """, limit)
-
 
 async def mark_outreach_sent(conn, outreach_id: str, provider_id: str | None):
     try:
@@ -445,7 +421,6 @@ async def mark_outreach_sent(conn, outreach_id: str, provider_id: str | None):
             where id=$1
         """, outreach_id)
 
-
 async def mark_outreach_bad(conn, outreach_id: str, status: str = "bad_email"):
     try:
         await conn.execute("""
@@ -460,7 +435,6 @@ async def mark_outreach_bad(conn, outreach_id: str, status: str = "bad_email"):
             where id=$1
         """, outreach_id, status)
 
-
 async def process_outreach_queue(conn):
     rows = await fetch_pending_outreach(conn, limit=OUTREACH_BATCH)
     if not rows:
@@ -469,7 +443,9 @@ async def process_outreach_queue(conn):
     for r in rows:
         outreach_id = str(r["id"])
         email_addr = (r["email"] or "").strip().lower()
-        lang = normalize_lang(r.get("preferred_lang"))
+
+        preferred_lang = r["preferred_lang"] if "preferred_lang" in r else None
+        lang = normalize_lang(preferred_lang)
 
         if not email_addr or "@" not in email_addr:
             await mark_outreach_bad(conn, outreach_id, "bad_email")
@@ -483,7 +459,6 @@ async def process_outreach_queue(conn):
         except Exception as e:
             log("Outreach error for", email_addr, ":", e)
             await mark_outreach_bad(conn, outreach_id, "send_failed")
-
 
 # ===================== IMAP PARSING =====================
 
@@ -530,24 +505,19 @@ def extract_text_body(msg: email.message.Message) -> str:
         except Exception:
             return payload.decode("utf-8", errors="ignore")
 
-
 # ===================== EMAIL FLOW =====================
 
 def _get_thread_headers_from_state(st: dict, inbound_msgid: str | None, inbound_refs: str | None):
-    # приоритет: то, что пришло сейчас → иначе то, что запомнили
     in_reply_to = inbound_msgid or st.get("thread_in_reply_to")
     references = st.get("thread_references") or inbound_refs
-    # пополняем references текущим msgid
     references = _merge_references(references, inbound_msgid)
     return in_reply_to, references
-
 
 async def send_categories(conn, to_email: str, lang: str, *, in_reply_to: str | None = None, references: str | None = None):
     cats = await get_categories(conn)
     body = TEXTS["confirm_start"][lang].format(choices=format_categories(cats, lang))
     send_email(to_email, INTRO_SUBJECT, body, in_reply_to=in_reply_to, references=references)
     log("Sent categories to", to_email)
-
 
 async def send_next_question_or_finish(conn, to_email: str, session_id: str, lang: str, *, in_reply_to: str | None = None, references: str | None = None):
     session = await conn.fetchrow("""
@@ -573,7 +543,6 @@ async def send_next_question_or_finish(conn, to_email: str, session_id: str, lan
     send_email(to_email, INTRO_SUBJECT, text_q, in_reply_to=in_reply_to, references=references)
     log("Asked question", str(q["id"]), "to", to_email)
 
-
 async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: str | None, inbound_refs: str | None):
     text = clean_reply_text(raw_text)
     cmd = norm_cmd(text)
@@ -595,6 +564,7 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
             await update_state(conn, str(session["id"]), {"lang": lang, "thread_in_reply_to": in_reply_to, "thread_references": references})
         else:
             in_reply_to, references = inbound_msgid, _merge_references(inbound_refs, inbound_msgid)
+
         send_email(from_email, INTRO_SUBJECT, TEXTS["lang_set"][lang], in_reply_to=in_reply_to, references=references)
         return
 
@@ -607,7 +577,6 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
 
     # start (YES variants)
     if is_yes(cmd):
-        # если сессии нет — создаём
         if not session:
             lang = "en"
             refs = _merge_references(inbound_refs, inbound_msgid)
@@ -616,11 +585,10 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
         else:
             session_id = str(session["id"])
             st = as_dict_state(session["state"])
-            lang = normalize_lang(st.get("lang", "en"))
+            lang = normalize_lang(st.get("lang") or "en")
 
         in_reply_to, references = _get_thread_headers_from_state(st, inbound_msgid, inbound_refs)
 
-        # ✅ после YES сразу просим выбрать сферу (без "sorry")
         await update_state(conn, session_id, {"lang": lang, "step": "await_category", "thread_in_reply_to": in_reply_to, "thread_references": references})
         await send_categories(conn, from_email, lang, in_reply_to=in_reply_to, references=references)
         return
@@ -634,11 +602,10 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
 
     session_id = str(session["id"])
     st = as_dict_state(session["state"])
-    lang = normalize_lang(st.get("lang", "en"))
+    lang = normalize_lang(st.get("lang") or "en")
     step = st.get("step")
 
     in_reply_to, references = _get_thread_headers_from_state(st, inbound_msgid, inbound_refs)
-    # обновляем в состоянии, чтобы держать thread даже если клиент шлёт без refs
     await update_state(conn, session_id, {"thread_in_reply_to": in_reply_to, "thread_references": references})
 
     # Step: await_category
@@ -659,7 +626,6 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
         chosen = cats[n - 1]
         await set_session_category(conn, session_id, str(chosen["id"]))
 
-        # ✅ дальше: один вопрос про обращение (Mr/Mrs/Ms)
         await update_state(conn, session_id, {"step": "await_contact"})
         send_email(from_email, INTRO_SUBJECT, TEXTS["ask_contact"][lang], in_reply_to=in_reply_to, references=references)
         log("Category chosen:", chosen["id"], "email:", from_email)
@@ -674,7 +640,6 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
             return
 
         if raw:
-            # store everything in ONE field (as requested)
             await update_state(conn, session_id, {"contact": raw, "step": "await_question"})
             await send_next_question_or_finish(conn, from_email, session_id, lang, in_reply_to=in_reply_to, references=references)
             log("Contact saved:", raw, "email:", from_email)
@@ -682,8 +647,6 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
 
         send_email(from_email, INTRO_SUBJECT, TEXTS["ask_contact"][lang], in_reply_to=in_reply_to, references=references)
         return
-
-    # Step: await_question
 
     # Step: await_question
     if step == "await_question":
@@ -700,7 +663,6 @@ async def handle_incoming(conn, from_email: str, raw_text: str, inbound_msgid: s
 
     # fallback
     send_email(from_email, INTRO_SUBJECT, INTRO_TEXT, in_reply_to=in_reply_to, references=references)
-
 
 # ===================== IMAP LOOP =====================
 
@@ -750,7 +712,6 @@ async def process_incoming_emails(conn):
 
     mail.logout()
 
-
 # ===================== MAIN =====================
 
 async def main():
@@ -770,7 +731,6 @@ async def main():
             log("Email worker error:", e)
 
         await asyncio.sleep(POLL_SECONDS)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
